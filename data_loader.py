@@ -2,7 +2,8 @@ import logging
 from data.database import engine, SessionLocal
 from data.models import create_dynamic_model, metadata
 from utils.api_client import APIClient
-import pandas as pd
+from sqlalchemy.dialects.postgresql import insert
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +32,50 @@ class DataLoader:
             "location",
             "car_data",
         ]
+        # Mapping of primary keys for each table
+        self.primary_keys_mapping = {
+            "meetings": ["meeting_key"],
+            "pit": [
+                "session_key",
+                "driver_number",
+            ],
+            "position": [
+                "session_key",
+                "driver_number",
+            ],
+            "race_control": [
+                "session_key",
+            ],
+            "sessions": ["session_key"],
+            "stints": [
+                "session_key",
+                "driver_number",
+            ],
+            "team_radio": [
+                "session_key",
+                "driver_number",
+            ],
+            "weather": [
+                "session_key",
+            ],
+            "drivers": ["driver_number"],
+            "laps": [
+                "session_key",
+                "driver_number",
+            ],
+            "intervals": [
+                "session_key",
+                "driver_number",
+            ],
+            "location": [
+                "session_key",
+                "driver_number",
+            ],
+            "car_data": [
+                "session_key",
+                "driver_number",
+            ],
+        }
         logging.info("DataLoader initialized.")
 
     def load_data(self):
@@ -39,7 +84,8 @@ class DataLoader:
             logging.info(f"Processing {key}")
             df = self.api_client.fetch_data(key)
             if df is not None and not df.empty:
-                self.store_data(key, df)
+                primary_keys = self.primary_keys_mapping.get(key)
+                self.store_data(key, df, primary_keys)
             else:
                 logging.warning(f"No data returned for {key}")
 
@@ -64,28 +110,62 @@ class DataLoader:
                     )
                     df = self.api_client.fetch_data(key, session_key, driver_number)
                     if df is not None and not df.empty:
-                        self.store_data(f"{key}_{session_key}_{driver_number}", df)
+                        # Add session_key and driver_number to df if not present
+                        if "session_key" not in df.columns:
+                            df["session_key"] = session_key
+                        if "driver_number" not in df.columns:
+                            df["driver_number"] = driver_number
+                        primary_keys = self.primary_keys_mapping.get(key)
+                        self.store_data(key, df, primary_keys)
                     else:
                         logging.warning(
                             f"No data returned for {key} with session {session_key} and driver {driver_number}"
                         )
 
-    def store_data(self, table_name, df):
+    def store_data(self, key, df, primary_keys=None):
+        # Use the key as the table name
+        table_name = key
+
+        logging.info(f"Preparing to store data in table {table_name}")
+
         # Create dynamic model
-        table = create_dynamic_model(table_name, df)
+        table = create_dynamic_model(table_name, df, primary_keys)
         metadata.create_all(engine, tables=[table])
 
-        # Insert data
-        conn = engine.connect()
         try:
-            df.to_sql(
-                table_name, con=conn, if_exists="append", index=False, method="multi"
-            )
-            logging.info(f"Data stored in table {table_name}")
+            with engine.begin() as conn:
+                if primary_keys:
+                    # Check for nulls in primary keys
+                    if df[primary_keys].isnull().any().any():
+                        logging.error(
+                            f"Null values found in primary key columns for table {table_name}"
+                        )
+                        logging.error(df[df[primary_keys].isnull().any(axis=1)])
+                        logging.error("Skipping the rows with null primary key values")
+                        df.dropna(subset=primary_keys, how="any", inplace=True)
+                    df.replace(
+                        {np.nan: None, np.inf: None, -np.inf: None}, inplace=True
+                    )
+                    records = df.to_dict(orient="records")
+                    stmt = insert(table).values(records)
+                    stmt = stmt.on_conflict_do_nothing(index_elements=primary_keys)
+                    result = conn.execute(stmt)
+                    logging.info(f"Inserted {result.rowcount} rows into {table_name}")
+                else:
+                    # Use df.to_sql with the connection from the context manager
+                    df.to_sql(
+                        table_name,
+                        con=conn,
+                        if_exists="append",
+                        index=False,
+                        method="multi",
+                        dtype=None,  # Let SQLAlchemy infer the data types
+                    )
+                    logging.info(
+                        f"Data stored in table {table_name} without primary keys"
+                    )
         except Exception as e:
-            logging.error(f"Failed to insert data into {table_name}: {e}")
-        finally:
-            conn.close()
+            logging.exception(f"Failed to insert data into {table_name}: {e}")
 
 
 if __name__ == "__main__":
